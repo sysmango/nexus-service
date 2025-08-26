@@ -1,2 +1,32 @@
----
-# vars file for nexus-service
+nfs_server: files  # NFS server for Nexus data volume
+nfs_nexus_data_path: /srv/nfs/prod/nexus  # NFS export path for Nexus data
+nfs_server_host: "{{ nfs_server }}"     # Hostname/IP to delegate NFS tasks to (must be reachable via SSH)
+nfs_dir_mode: "0777"                    # Permissions for Nexus export root
+nfs_dir_owner: "200"                    # Nexus container runs as UID 200 by default
+nfs_dir_group: "200"                    # Nexus container GID 200
+
+# Kubernetes namespace to deploy Nexus and its resources into
+nexus_namespace: "sysmango-core-prod"
+
+# PostgreSQL settings for Nexus database
+postgres_db: nexus
+postgres_user: nexus
+postgres_password: "CHANGE_ME_SECURELY"  # Store securely via Ansible Vault in real usage
+
+# HashiCorp Vault integration
+use_vault_for_db: true
+# Example KV v2 path: kv/data/sysmango/nexus/db (module strips kv/data/ automatically)
+postgres_vault_secret: "sysmango/nexus/db"
+# Vault connection can be provided via env or here (env takes precedence in play environment)
+vault_addr: "https://vault.sysmango.net:8200"
+# vault_token should be provided securely (e.g., environment variable, Ansible Vault, or injected via runner)
+# vault_token: ""
+vault_namespace: ""  # leave empty if not using namespaces
+
+# CA trust for Vault TLS
+# VAULT_CAPATH is respected by the Vault client and the community.hashi_vault lookup via environment
+# Set to a directory containing hashed CA certs (e.g., /etc/ssl/certs on many distros)
+vault_ca_path: "/etc/ssl/certs"
+# Some components (python requests, plugin param) work best with a single CA bundle file.
+# Override this if your distro uses a different path.
+vault_ca_cert: "/etc/ssl/certs/ca-certificates.crt"

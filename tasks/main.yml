@@ -1,43 +1,477 @@
 ---
+- name: Preflight | Check cert-manager CRDs present
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: certificates.cert-manager.io
+  register: cm_cert_crd
 
-- name: Check if Sonatype Nexus service is running
-  shell: docker service ls | awk '{print $2}' | grep nexus
-  changed_when: false
-  register: nexus_status
-  failed_when: nexus_status.rc == 2
+- name: Preflight | Check cert-manager ClusterIssuer CRD present
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: clusterissuers.cert-manager.io
+  register: cm_ci_crd
 
-- name: Create nexus volume directory
-  hosts: nfs-server[0]
-  become: "yes"
-  file:
-    path: /srv/nfs/nexus
+- name: Preflight | Check Traefik IngressRoute CRD present
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: ingressroutes.traefik.io
+  register: traefik_ir_crd
+
+- name: Preflight | Assert required CRDs exist
+  ansible.builtin.assert:
+    that:
+      - (cm_cert_crd.resources | length) > 0
+      - (cm_ci_crd.resources | length) > 0
+      - (traefik_ir_crd.resources | length) > 0
+    fail_msg: "Required CRDs missing. Ensure cert-manager and Traefik v3 are installed (certificates.cert-manager.io, clusterissuers.cert-manager.io, ingressroutes.traefik.io)."
+    success_msg: "All required CRDs are present."
+
+- name: Vault | Read Nexus DB secret (KV v2)
+  hashivault_read:
+    url: "{{ vault_addr }}"
+    namespace: "{{ vault_namespace | default('') }}"
+    mount_point: "kv"
+    secret: "{{ postgres_vault_secret  }}"
+    version: 2
+    verify: false
+  register: vault_db
+  environment:
+    VAULT_ADDR: "{{ vault_addr }}"
+    VAULT_NAMESPACE: "{{ vault_namespace | default('') }}"
+  when: use_vault_for_db | default(true)
+
+- name: Set DB facts from Vault secret (KV v2)
+  ansible.builtin.set_fact:
+    vault_secret_map: "{{ vault_db.value | default(vault_db.data) }}"
+    postgres_db: "{{ vault_db.value.postgres_db | default(vault_db.data.postgres_db) }}"
+    postgres_user: "{{ vault_db.value.postgres_user | default(vault_db.data.postgres_user) }}"
+    postgres_password: "{{ vault_db.value.postgres_password | default(vault_db.data.postgres_password) }}"
+  when: use_vault_for_db | default(true)
+
+- name: Validate Vault DB values present (if enabled)
+  ansible.builtin.assert:
+    that:
+      - (postgres_db | default('')) | length > 0
+      - (postgres_user | default('')) | length > 0
+      - (postgres_password | default('')) | length > 0
+    fail_msg: "Vault DB values missing. Ensure you are logged in (vault login) and the secret {{ postgres_vault_secret }} has keys: postgres_db, postgres_user, postgres_password."
+    success_msg: "Vault DB values loaded."
+  when: use_vault_for_db | default(true)
+
+- name: Preflight | Assert nfs_server_host is provided
+  ansible.builtin.assert:
+    that:
+      - (nfs_server_host | default('')) | length > 0
+    fail_msg: "nfs_server_host is not set. Provide the inventory host or IP of the NFS server."
+    success_msg: "nfs_server_host provided."
+
+- name: NFS | Verify connectivity to NFS server
+  ansible.builtin.ping:
+  delegate_to: "{{ nfs_server_host }}"
+
+- name: NFS | Create Nexus export root directory on NFS server
+  ansible.builtin.file:
+    path: "{{ nfs_nexus_data_path }}"
     state: directory
-    mode: 0777
-  any_errors_fatal: true
-  when: nexus_status.rc == 1
+    mode: "{{ nfs_dir_mode }}"
+    owner: "{{ nfs_dir_owner }}"
+    group: "{{ nfs_dir_group }}"
+    recurse: true
+  delegate_to: "{{ nfs_server_host }}"
+  become: true
 
-- name: Deploy docker nexus service
-  hosts: docker-manager
-  shell: |
-    docker service create -d \
-    --name nexus \
-    --network mangonet \
-    --publish 5000:5001 \
-    --mount 'type=volume,"volume-opt=o=addr=grid011.sysmango.net,vers=4.1",volume-opt=device=:/srv/nfs/nexus,volume-opt=type=nfs,target=/nexus-data' \
-    --replicas 1 \
-    --label traefik.docker.network=mangonet \
-    --label traefik.nexus.port=8081 \
-    --label traefik.nexus.frontend.rule="Host:nexus.sysmango.net" \
-    --label traefik.nexus.docker.network=mangonet \
-    --label traefik.registry.port=5000 \
-    --label traefik.registry.frontend.rule="Host:registry.sysmango.net" \
-    --label traefik.registry.docker.network=mangonet \
-    sonatype/nexus3
-  when: nexus_status.rc == 1
+- name: Create Nexus namespace
+  kubernetes.core.k8s:
+    name: "{{ nexus_namespace }}"
+    api_version: v1
+    kind: Namespace
+    state: present
 
-- name: Wait for port 5000  to open so the private registry is accessible
-  wait_for:
-    host: registry.sysmango.net
-    port: 5000
-    timeout: 5000
-    state: started
+- name: Create Certificate for Nexus hosts (cert-manager)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: nexus-cert
+        namespace: "{{ nexus_namespace }}"
+      spec:
+        secretName: nexus-tls
+        commonName: nexus.sysmango.net
+        dnsNames:
+          - nexus.sysmango.net
+          - push.sysmango.net
+          - registry.sysmango.net
+        issuerRef:
+          name: vault-issuer
+          kind: ClusterIssuer
+
+- name: Create Nexus DB config secret (nexus.properties)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: nexus-db-config
+        namespace: "{{ nexus_namespace }}"
+      type: Opaque
+      stringData:
+        nexus.properties: |
+          database.type=postgresql
+          database.hostname=nexus-postgres
+          database.port=5432
+          database.name={{ postgres_db }}
+          database.username={{ postgres_user }}
+          database.password={{ postgres_password }}
+
+- name: Create Postgres PVC (k3s local-path)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: nexus-postgres-pvc
+        namespace: "{{ nexus_namespace }}"
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 10Gi
+
+- name: Deploy PostgreSQL for Nexus (StatefulSet)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: nexus-postgres
+        namespace: "{{ nexus_namespace }}"
+      spec:
+        serviceName: nexus-postgres
+        replicas: 1
+        selector:
+          matchLabels:
+            app: nexus-postgres
+        template:
+          metadata:
+            labels:
+              app: nexus-postgres
+          spec:
+            containers:
+              - name: postgres
+                image: postgres:16
+                imagePullPolicy: IfNotPresent
+                ports:
+                  - containerPort: 5432
+                env:
+                  - name: POSTGRES_DB
+                    value: "{{ postgres_db }}"
+                  - name: POSTGRES_USER
+                    value: "{{ postgres_user }}"
+                  - name: POSTGRES_PASSWORD
+                    value: "{{ postgres_password }}"
+                volumeMounts:
+                  - name: data
+                    mountPath: /var/lib/postgresql/data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: nexus-postgres-pvc
+
+- name: Create Postgres service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: nexus-postgres
+        namespace: "{{ nexus_namespace }}"
+      spec:
+        ports:
+          - name: postgres
+            port: 5432
+            targetPort: 5432
+        selector:
+          app: nexus-postgres
+
+- name: Deploy Nexus deployment
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: nexus
+        namespace: "{{ nexus_namespace }}"
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: nexus
+        template:
+          metadata:
+            labels:
+              app: nexus
+          spec:
+            securityContext:
+              runAsUser: 200
+              runAsGroup: 200
+              fsGroup: 200
+              fsGroupChangePolicy: OnRootMismatch
+            containers:
+              - name: nexus
+                image: sonatype/nexus3
+                ports:
+                  - containerPort: 8081
+                  - containerPort: 5000
+                  - containerPort: 5001
+                volumeMounts:
+                  - name: nexus-data
+                    mountPath: /nexus-data
+                  - name: nexus-db-config
+                    mountPath: /nexus-data/etc/nexus.properties
+                    subPath: nexus.properties
+            volumes:
+              - name: nexus-data
+                nfs:
+                  server: "{{ nfs_server }}"  # Use the variable for the NFS server
+                  path: "{{ nfs_nexus_data_path }}"
+              - name: nexus-db-config
+                secret:
+                  secretName: nexus-db-config
+
+- name: Create Nexus service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: nexus
+        namespace: "{{ nexus_namespace }}"
+      spec:
+        ports:
+          - name: http
+            port: 8081
+            targetPort: 8081
+          - name: registry
+            port: 5000
+            targetPort: 5000
+          - name: registry-ssl
+            port: 5001
+            targetPort: 5001
+        selector:
+          app: nexus
+
+- name: Create Traefik IngressRoute for Nexus (Traefik v3)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: nexus-ingressroute
+        namespace: "{{ nexus_namespace }}"
+      spec:
+        entryPoints:
+          - websecure
+        tls:
+          secretName: nexus-tls
+        routes:
+          - match: Host(`nexus.sysmango.net`)
+            kind: Rule
+            services:
+              - name: nexus
+                port: 8081
+          - match: Host(`push.sysmango.net`)
+            kind: Rule
+            services:
+              - name: nexus
+                port: 5001
+          - match: Host(`registry.sysmango.net`)
+            kind: Rule
+            services:
+              - name: nexus
+                port: 5000
+
+- name: Registry | Fetch Nexus registry credentials from Vault (KV v2)
+  hashivault_read:
+    url: "{{ vault_addr }}"
+    namespace: "{{ vault_namespace | default('') }}"
+    mount_point: "kv"
+    secret: "{{ nexus_registry_vault_secret }}"
+    version: 2
+    verify: false
+  register: vault_registry
+  environment:
+    VAULT_ADDR: "{{ vault_addr }}"
+    VAULT_NAMESPACE: "{{ vault_namespace | default('') }}"
+  when: use_vault_for_registry | default(true)
+
+- name: Registry | Set facts from Vault secret (KV v2)
+  ansible.builtin.set_fact:
+    nexus_registry_secret_map: "{{ vault_registry.value | default(vault_registry.data) }}"
+    nexus_username: "{{ (vault_registry.value.username | default(vault_registry.data.username)) | default('') }}"
+    nexus_password: "{{ (vault_registry.value.password | default(vault_registry.data.password)) | default('') }}"
+  when: use_vault_for_registry | default(true)
+
+- name: Registry | Validate Vault registry values present (if enabled)
+  ansible.builtin.assert:
+    that:
+      - (nexus_username | default('')) | length > 0
+      - (nexus_password | default('')) | length > 0
+    fail_msg: "Vault registry values missing. Ensure secret {{ nexus_registry_vault_secret }} has keys: username, password."
+    success_msg: "Vault registry values loaded."
+  when: use_vault_for_registry | default(true)
+
+- name: Registry | Create /etc/rancher/k3s on each node
+  ansible.builtin.file:
+    path: /etc/rancher/k3s
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+  become: true
+  delegate_to: "{{ item }}"
+  loop: "{{ groups[k3s_nodes_group] | default([]) }}"
+  run_once: true
+
+- name: Registry | Create registries.yaml on each node
+  ansible.builtin.template:
+    src: registries.yaml.j2
+    dest: /etc/rancher/k3s/registries.yaml
+    mode: '0644'
+    owner: root
+    group: root
+    backup: true
+  become: true
+  delegate_to: "{{ item }}"
+  loop: "{{ groups[k3s_nodes_group] | default([]) }}"
+  notify: restart k3s
+  run_once: true
+
+- name: Registry | Verify registries.yaml on each node
+  ansible.builtin.command: cat /etc/rancher/k3s/registries.yaml
+  changed_when: false
+  become: true
+  delegate_to: "{{ item }}"
+  loop: "{{ groups[k3s_nodes_group] | default([]) }}"
+  register: registry_config
+  run_once: true
+
+- name: Registry | Display registries.yaml from first node
+  ansible.builtin.debug:
+    var: registry_config.stdout_lines
+
+- name: Cleanup | Remove Nexus Kubernetes resources
+  tags:
+    - never
+    - cleanup
+  block:
+    - name: Cleanup | Remove Traefik IngressRoute
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: traefik.io/v1alpha1
+          kind: IngressRoute
+          metadata:
+            name: nexus-ingressroute
+            namespace: "{{ nexus_namespace }}"
+
+    - name: Cleanup | Remove Nexus services
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: nexus
+            namespace: "{{ nexus_namespace }}"
+
+    - name: Cleanup | Remove Postgres service
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: nexus-postgres
+            namespace: "{{ nexus_namespace }}"
+
+    - name: Cleanup | Remove Nexus deployment
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: nexus
+            namespace: "{{ nexus_namespace }}"
+
+    - name: Cleanup | Remove Postgres StatefulSet
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: nexus-postgres
+            namespace: "{{ nexus_namespace }}"
+
+    - name: Cleanup | Remove Postgres PVC
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: nexus-postgres-pvc
+            namespace: "{{ nexus_namespace }}"
+
+    - name: Cleanup | Remove DB config secret
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: nexus-db-config
+            namespace: "{{ nexus_namespace }}"
+
+    - name: Cleanup | Remove Certificate
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: nexus-cert
+            namespace: "{{ nexus_namespace }}"
+
+    - name: Cleanup | Remove TLS secret (nexus-tls)
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: nexus-tls
+            namespace: "{{ nexus_namespace }}"
+
+    - name: Cleanup | Remove Nexus namespace (last)
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ nexus_namespace }}"

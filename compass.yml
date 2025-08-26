@@ -1,0 +1,82 @@
+configVersion: 1
+name: nexus-service
+id: 'ari:cloud:compass:006a6c35-95c8-4a9c-bf41-6f26f474ed02:component/d7b126b6-b701-47d8-937f-d80ce2357ad8/47852543-66e1-4572-abf6-00f509c94e0d'
+description: "Container-based Nexus Repository Manager for artifact storage and distribution"
+typeId: SERVICE
+ownerId: 'ari:cloud:identity::team/1f652a16-6984-43de-bd00-bb1ce9d8c62f'
+
+fields:
+  isMonorepoProject: false
+  tier: 4
+  # Enhanced fields for better categorization
+  deploymentType: "Container (Docker/Kubernetes)"
+  infrastructure: "Ansible-managed"
+  serviceType: "Infrastructure"
+  criticality: "High"
+  
+links:
+  - name: "Source Repository"
+    type: REPOSITORY
+    url: 'https://github.com/sysmango/nexus-service'
+  # Add operational links
+  - name: "Nexus Web UI"
+    type: DASHBOARD
+    url: "https://nexus.sysmango.net"
+  - name: "Monitoring Dashboard"
+    type: DASHBOARD
+    url: "https://monitoring.sysmango.net/nexus"
+  - name: "Deployment Runbook"
+    type: DOCUMENTATION
+    url: "https://docs.sysmango.net/nexus/deployment"
+  - name: "Incident Response Guide"
+    type: DOCUMENTATION
+    url: "https://docs.sysmango.net/nexus/incidents"
+  - name: "Backup & Recovery Procedures"
+    type: DOCUMENTATION
+    url: "https://docs.sysmango.net/nexus/backup"
+
+relationships:
+  # Add dependencies when you identify them
+  dependencies:
+    - componentSelector:
+        field: "name"
+        operator: "EQUALS"
+        value: "container-registry"
+      type: "DEPENDS_ON"
+    - componentSelector:
+        field: "name" 
+        operator: "EQUALS"
+        value: "storage-backend"
+      type: "DEPENDS_ON"
+
+labels:
+  - 'source:github'
+  - synced-with-jsm
+  # Add infrastructure-focused labels
+  - artifact-management
+  - infrastructure
+  - shared-service
+  - container-deployment
+  - ansible-managed
+
+customFields:
+  # Infrastructure-specific custom fields
+  - name: "Container Runtime"
+    value: "Docker"
+  - name: "Orchestration"
+    value: "Ansible Playbook"
+  - name: "Storage Type"
+    value: "Persistent Volume"
+  - name: "Backup Schedule"
+    value: "Daily 2AM UTC"
+  - name: "RTO Target"
+    value: "4 hours"
+  - name: "RPO Target"  
+    value: "24 hours"
+  - name: "Maintenance Window"
+    value: "Sunday 3-5 AM UTC"
+  - name: "Security Scan Schedule"
+    value: "Weekly"
+
+# Learn more about formatting compass.yml:
+# https://go.atlassian.com/compass-yml-format
