@@ -229,7 +229,7 @@
               fsGroupChangePolicy: OnRootMismatch
             containers:
               - name: nexus
-                image: sonatype/nexus3
+                image: sonatype/nexus3:3.84.0
                 ports:
                   - containerPort: 8081
                   - containerPort: 5000
