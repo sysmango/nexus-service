@@ -8,10 +8,10 @@ nfs_dir_group: "200"                    # Nexus container GID 200
 # Kubernetes namespace to deploy Nexus and its resources into
 nexus_namespace: "sysmango-core-prod"
 
-# PostgreSQL settings for Nexus database
-postgres_db: nexus
-postgres_user: nexus
-postgres_password: "CHANGE_ME_SECURELY"  # Store securely via Ansible Vault in real usage
+# PostgreSQL settings for Nexus database (namespaced)
+nexus_postgres_db: nexus
+nexus_postgres_user: nexus
+nexus_postgres_password: "CHANGE_ME_SECURELY"  # Store securely via Ansible Vault in real usage
 
 # HashiCorp Vault integration
 use_vault_for_db: true

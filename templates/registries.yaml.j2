@@ -13,9 +13,11 @@ mirrors:
   docker.io:
     endpoint:
       - https://{{ nexus_registry_url }}
+      - https://registry-1.docker.io
   registry.k8s.io:
     endpoint:
       - https://{{ nexus_registry_url }}
+      - https://registry.k8s.io
 {% for repo in registry_extra_mirrors | default([]) %}
   {{ repo }}:
     endpoint:

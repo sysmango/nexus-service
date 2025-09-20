@@ -1,0 +1,34 @@
+---
+# K3s node group to target for registries.yaml rollout
+k3s_nodes_group: "k3s"
+
+# Nexus registry URL used by containerd mirrors (include port if not 443)
+# Example when routed via Traefik with TLS:
+nexus_registry_url: "registry.sysmango.net"
+
+# Cleanup safety
+cleanup_namespace: false
+
+# Registry credentials source
+# If true, read creds from Vault KV v2 at nexus_registry_vault_secret
+# If false, use nexus_username/nexus_password defined below
+use_vault_for_registry: true
+nexus_registry_vault_secret: "sysmango/nexus/registry"
+
+# Optional direct credentials (used only if use_vault_for_registry is false)
+nexus_username: ""
+nexus_password: ""
+
+# TLS options for containerd when talking to Nexus
+# If using internal CA that nodes do not yet trust, temporarily set to true
+insecure_skip_verify: false
+
+# Additional mirrors to redirect via Nexus (will point to Nexus endpoint)
+# e.g., ["quay.io", "gcr.io"]
+registry_extra_mirrors: ["quay.io", "gcr.io", "mcr.microsoft.com"]
+
+# NFS Configuration
+nfs_server_host: files.sysmango.net
+nfs_dir_mode: '0755'
+nfs_dir_owner: '200'
+nfs_dir_group: '200'

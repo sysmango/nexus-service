@@ -1,0 +1,18 @@
+---
+# Restart k3s services on the node where the notifying task ran.
+
+- name: Restart k3s server if present
+  listen: restart k3s
+  become: true
+  ansible.builtin.service:
+    name: k3s
+    state: restarted
+  failed_when: false
+
+- name: Restart k3s agent if present
+  listen: restart k3s
+  become: true
+  ansible.builtin.service:
+    name: k3s-agent
+    state: restarted
+  failed_when: false

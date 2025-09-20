@@ -46,17 +46,17 @@
 - name: Set DB facts from Vault secret (KV v2)
   ansible.builtin.set_fact:
     vault_secret_map: "{{ vault_db.value | default(vault_db.data) }}"
-    postgres_db: "{{ vault_db.value.postgres_db | default(vault_db.data.postgres_db) }}"
-    postgres_user: "{{ vault_db.value.postgres_user | default(vault_db.data.postgres_user) }}"
-    postgres_password: "{{ vault_db.value.postgres_password | default(vault_db.data.postgres_password) }}"
+    nexus_postgres_db: "{{ vault_db.value.postgres_db | default(vault_db.data.postgres_db) }}"
+    nexus_postgres_user: "{{ vault_db.value.postgres_user | default(vault_db.data.postgres_user) }}"
+    nexus_postgres_password: "{{ vault_db.value.postgres_password | default(vault_db.data.postgres_password) }}"
   when: use_vault_for_db | default(true)
 
 - name: Validate Vault DB values present (if enabled)
   ansible.builtin.assert:
     that:
-      - (postgres_db | default('')) | length > 0
-      - (postgres_user | default('')) | length > 0
-      - (postgres_password | default('')) | length > 0
+      - (nexus_postgres_db | default('')) | length > 0
+      - (nexus_postgres_user | default('')) | length > 0
+      - (nexus_postgres_password | default('')) | length > 0
     fail_msg: "Vault DB values missing. Ensure you are logged in (vault login) and the secret {{ postgres_vault_secret }} has keys: postgres_db, postgres_user, postgres_password."
     success_msg: "Vault DB values loaded."
   when: use_vault_for_db | default(true)
@@ -125,9 +125,46 @@
           database.type=postgresql
           database.hostname=nexus-postgres
           database.port=5432
-          database.name={{ postgres_db }}
-          database.username={{ postgres_user }}
-          database.password={{ postgres_password }}
+          database.name={{ nexus_postgres_db }}
+          database.username={{ nexus_postgres_user }}
+          database.password={{ nexus_postgres_password }}
+
+- name: Create Nexus data PersistentVolume (NFS)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata:
+        name: nexus-data-pv
+      spec:
+        capacity:
+          storage: 100Gi
+        accessModes:
+          - ReadWriteMany
+        persistentVolumeReclaimPolicy: Retain
+        mountOptions:
+          - nfsvers=4.1
+        nfs:
+          server: "{{ nfs_server_host }}"
+          path: "{{ nfs_nexus_data_path }}"
+
+- name: Create Nexus data PVC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: nexus-data-pvc
+        namespace: "{{ nexus_namespace }}"
+      spec:
+        accessModes: ["ReadWriteMany"]
+        storageClassName: ""
+        resources:
+          requests:
+            storage: 100Gi
+        volumeName: nexus-data-pv
 
 - name: Create Postgres PVC (k3s local-path)
   kubernetes.core.k8s:
@@ -173,11 +210,11 @@
                   - containerPort: 5432
                 env:
                   - name: POSTGRES_DB
-                    value: "{{ postgres_db }}"
+                    value: "{{ nexus_postgres_db }}"
                   - name: POSTGRES_USER
-                    value: "{{ postgres_user }}"
+                    value: "{{ nexus_postgres_user }}"
                   - name: POSTGRES_PASSWORD
-                    value: "{{ postgres_password }}"
+                    value: "{{ nexus_postgres_password }}"
                 volumeMounts:
                   - name: data
                     mountPath: /var/lib/postgresql/data
@@ -223,13 +260,13 @@
               app: nexus
           spec:
             securityContext:
-              runAsUser: 200
-              runAsGroup: 200
-              fsGroup: 200
+              runAsUser: 33
+              runAsGroup: 33
+              fsGroup: 33
               fsGroupChangePolicy: OnRootMismatch
             containers:
               - name: nexus
-                image: sonatype/nexus3:3.84.0
+                image: sonatype/nexus3
                 ports:
                   - containerPort: 8081
                   - containerPort: 5000
@@ -242,9 +279,8 @@
                     subPath: nexus.properties
             volumes:
               - name: nexus-data
-                nfs:
-                  server: "{{ nfs_server }}"  # Use the variable for the NFS server
-                  path: "{{ nfs_nexus_data_path }}"
+                persistentVolumeClaim:
+                  claimName: nexus-data-pvc
               - name: nexus-db-config
                 secret:
                   secretName: nexus-db-config
@@ -333,6 +369,55 @@
     success_msg: "Vault registry values loaded."
   when: use_vault_for_registry | default(true)
 
+- name: CA Trust | Find local CA certificates
+  ansible.builtin.find:
+    paths: "{{ local_ca_path | default('/etc/pki/trust/anchors') }}"
+    patterns: "SysMango*.crt,SysMango*.pem"
+  register: local_ca_files
+  delegate_to: localhost
+  run_once: true
+
+- name: CA Trust | Copy certificates to trust anchors on each node (openSUSE)
+  ansible.builtin.copy:
+    src: "{{ item.1.path }}"
+    dest: "/etc/pki/trust/anchors/{{ item.1.path | basename }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop: "{{ groups[k3s_nodes_group] | default([]) | product(local_ca_files.files | default([])) | list }}"
+  become: true
+  delegate_to: "{{ item.0 }}"
+
+- name: CA Trust | Update CA trust store on each node (openSUSE)
+  ansible.builtin.command: update-ca-certificates
+  become: true
+  delegate_to: "{{ item }}"
+  loop: "{{ groups[k3s_nodes_group] | default([]) }}"
+
+- name: CA Trust | Create containerd certs.d directory for Nexus on each node
+  ansible.builtin.file:
+    path: "/var/lib/rancher/k3s/agent/etc/containerd/certs.d/{{ nexus_registry_url }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+  delegate_to: "{{ item }}"
+  loop: "{{ groups[k3s_nodes_group] | default([]) }}"
+
+- name: CA Trust | Install CA cert for containerd Nexus registry on each node
+  ansible.builtin.copy:
+    src: "{{ local_ca_files.files[0].path }}"
+    dest: "/var/lib/rancher/k3s/agent/etc/containerd/certs.d/{{ nexus_registry_url }}/ca.crt"
+    owner: root
+    group: root
+    mode: '0644'
+  when: (local_ca_files.files | default([])) | length > 0
+  become: true
+  delegate_to: "{{ item }}"
+  loop: "{{ groups[k3s_nodes_group] | default([]) }}"
+  notify: restart k3s
+
 - name: Registry | Create /etc/rancher/k3s on each node
   ansible.builtin.file:
     path: /etc/rancher/k3s
@@ -343,7 +428,6 @@
   become: true
   delegate_to: "{{ item }}"
   loop: "{{ groups[k3s_nodes_group] | default([]) }}"
-  run_once: true
 
 - name: Registry | Create registries.yaml on each node
   ansible.builtin.template:
@@ -357,7 +441,6 @@
   delegate_to: "{{ item }}"
   loop: "{{ groups[k3s_nodes_group] | default([]) }}"
   notify: restart k3s
-  run_once: true
 
 - name: Registry | Verify registries.yaml on each node
   ansible.builtin.command: cat /etc/rancher/k3s/registries.yaml
@@ -366,17 +449,23 @@
   delegate_to: "{{ item }}"
   loop: "{{ groups[k3s_nodes_group] | default([]) }}"
   register: registry_config
-  run_once: true
 
-- name: Registry | Display registries.yaml from first node
+- name: Registry | Display registries.yaml from each node
   ansible.builtin.debug:
-    var: registry_config.stdout_lines
+    msg: "{{ item.item }}: {{ item.stdout_lines | default(item.stderr_lines | default('')) }}"
+  loop: "{{ registry_config.results | default([]) }}"
 
 - name: Cleanup | Remove Nexus Kubernetes resources
   tags:
     - never
     - cleanup
+  when:
+    - cleanup | default(false)
+    - "'nexus-service' in ansible_run_tags"
   block:
+    - name: Cleanup | Proceed marker
+      ansible.builtin.debug:
+        msg: "Running cleanup for nexus-service"
     - name: Cleanup | Remove Traefik IngressRoute
       kubernetes.core.k8s:
         state: absent
@@ -467,7 +556,7 @@
             name: nexus-tls
             namespace: "{{ nexus_namespace }}"
 
-    - name: Cleanup | Remove Nexus namespace (last)
+    - name: Cleanup | Remove Namespace (last)
       kubernetes.core.k8s:
         state: absent
         definition:
@@ -475,3 +564,4 @@
           kind: Namespace
           metadata:
             name: "{{ nexus_namespace }}"
+      when: cleanup_namespace | default(false)
